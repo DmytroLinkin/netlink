@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"net"
 	"syscall"
 
 	"github.com/vishvananda/netlink/nl"
@@ -117,6 +118,317 @@ func (filter *Fw) Attrs() *FilterAttrs {
 
 func (filter *Fw) Type() string {
 	return "fw"
+}
+
+// Flower filter represents "flower" classifier.
+type Flower struct {
+	FilterAttrs
+	ClassId uint32
+	Flags   uint32
+	Keys    map[int]FlowerKey
+	Actions []Action
+}
+
+func NewFlowerFilter(attrs FilterAttrs, classId, flags uint32) *Flower {
+	return &Flower{
+		FilterAttrs: attrs,
+		ClassId:     classId,
+		Flags:       flags,
+		Keys:        make(map[int]FlowerKey),
+	}
+}
+
+func (filter *Flower) Attrs() *FilterAttrs {
+	return &filter.FilterAttrs
+}
+
+func (filter *Flower) Type() string {
+	return "flower"
+}
+
+// String() returns human readable representation of the flower filter,
+// including filter attributes, flags, keys and actions
+func (filter *Flower) String() string {
+	str := "Flower{Attrs" + filter.FilterAttrs.String()
+	str += fmt.Sprintf(", ClassId: %d, ", filter.ClassId)
+	var first bool
+	if filter.Flags == 0 {
+		str += "Flags: none"
+	} else {
+		str += "Flags: "
+		first = true
+		for flag := uint32(1); flag <= nl.TCA_CLS_FLAGS_LAST; flag = flag << 1 {
+			if filter.Flags&flag != 0 {
+				if first {
+					first = false
+				} else {
+					str += "|"
+				}
+				switch flag {
+				case nl.TCA_CLS_FLAGS_SKIP_HW:
+					str += "skip_hw"
+				case nl.TCA_CLS_FLAGS_SKIP_SW:
+					str += "skip_sw"
+				case nl.TCA_CLS_FLAGS_IN_HW:
+					str += "in_hw"
+				case nl.TCA_CLS_FLAGS_NOT_IN_HW:
+					str += "not_in_hw"
+				case nl.TCA_CLS_FLAGS_VERBOSE:
+					str += "verbose"
+				}
+			}
+		}
+	}
+	if len(filter.Keys) != 0 {
+		str += ", Keys{"
+		first = true
+		for i := nl.TCA_FLOWER_KEY_ETH_DST; i < nl.TCA_FLOWER_MAX; i++ {
+			if key, exist := filter.Keys[i]; exist {
+				if first {
+					first = false
+				} else {
+					str += ", "
+				}
+				str += fmt.Sprintf("%s", key)
+			}
+		}
+		str += "}"
+	}
+	if len(filter.Actions) != 0 {
+		str += ", Actions{"
+		first = true
+		for _, act := range filter.Actions {
+			if first {
+				first = false
+			} else {
+				str += ", "
+			}
+			str += fmt.Sprintf("%v", act)
+		}
+		str += "}"
+	}
+	str += "}"
+	return str
+}
+
+// with methods, hidden from user, for generic key's types
+func (filter *Flower) withKeyEth(id int, addr net.HardwareAddr) *Flower {
+	filter.Keys[id] = &FlowerKeyEthAddr{id: id, addr: addr}
+	return filter
+}
+
+func (filter *Flower) withKeyU8(id int, val uint8) *Flower {
+	filter.Keys[id] = &FlowerKeyU8{id: id, val: val}
+	return filter
+}
+
+func (filter *Flower) withKeyU16(id int, val uint16) *Flower {
+	filter.Keys[id] = &FlowerKeyU16{id: id, val: val}
+	return filter
+}
+
+// WithKey methods allow chained flower keys creation. For ex.:
+//
+// filter = filter.WithKeyEthSrc(srcAddr).WithKeyIpProto(unix.IPPROTO_ICMP)
+//
+// If key can be masked, there is coresponding WithMasked method:
+//
+// filter = filter.WithMaskedKeyEthSrc(srcAddr, srcAddrMask)
+//
+// NOTE: masked key still created with mask even if WithKey method used.
+// It's for ensurance that kernel didn't zeroed key because of bug, for ex..
+// Usualy kernel do set mask if it's not specified for such keys.
+
+func (filter *Flower) WithKeyEthDst(addr net.HardwareAddr) *Flower {
+	return filter.withKeyEth(nl.TCA_FLOWER_KEY_ETH_DST, addr).
+		withKeyEth(nl.TCA_FLOWER_KEY_ETH_DST_MASK, ethAddrMask())
+}
+
+func (filter *Flower) WithMaskedEthDst(addr, mask net.HardwareAddr) *Flower {
+	return filter.withKeyEth(nl.TCA_FLOWER_KEY_ETH_DST, addr).
+		withKeyEth(nl.TCA_FLOWER_KEY_ETH_DST_MASK, mask)
+}
+
+func (filter *Flower) WithKeyEthSrc(addr net.HardwareAddr) *Flower {
+	return filter.withKeyEth(nl.TCA_FLOWER_KEY_ETH_SRC, addr).
+		withKeyEth(nl.TCA_FLOWER_KEY_ETH_SRC_MASK, ethAddrMask())
+}
+
+func (filter *Flower) WithMaskedEthSrc(addr, mask net.HardwareAddr) *Flower {
+	return filter.withKeyEth(nl.TCA_FLOWER_KEY_ETH_SRC, addr).
+		withKeyEth(nl.TCA_FLOWER_KEY_ETH_SRC_MASK, mask)
+}
+
+func (filter *Flower) WithKeyEthType(val uint16) *Flower {
+	return filter.withKeyU16(nl.TCA_FLOWER_KEY_ETH_TYPE, val)
+}
+
+func (filter *Flower) WithKeyIpProto(val uint8) *Flower {
+	return filter.withKeyU8(nl.TCA_FLOWER_KEY_IP_PROTO, val)
+}
+
+func (filter *Flower) WithKeyVlanID(val uint16) *Flower {
+	filter.Keys[nl.TCA_FLOWER_KEY_VLAN_ID] = &FlowerKeyVlanID{id: nl.TCA_FLOWER_KEY_VLAN_ID, val: val}
+	return filter
+}
+
+func (filter *Flower) WithKeyVlanPrio(val uint8) *Flower {
+	return filter.withKeyU8(nl.TCA_FLOWER_KEY_VLAN_PRIO, val)
+}
+
+func (filter *Flower) WithKeyVlanEthType(val uint16) *Flower {
+	return filter.withKeyU16(nl.TCA_FLOWER_KEY_VLAN_ETH_TYPE, val)
+}
+
+// FlowerKey is an interface which represents packet's fields.
+// Serialize used during creation of netlink message.
+// Deserialize used during parsing of netlink message.
+// ID returns Key's id for comparisson operations.
+type FlowerKey interface {
+	Serialize() []byte
+	Deserialize([]byte)
+	ID() int
+}
+
+func flowerKeyId2String(id int) string {
+	switch id {
+	case nl.TCA_FLOWER_KEY_ETH_DST:
+		return "eth_dst"
+	case nl.TCA_FLOWER_KEY_ETH_DST_MASK:
+		return "eth_dst_mask"
+	case nl.TCA_FLOWER_KEY_ETH_SRC:
+		return "eth_src"
+	case nl.TCA_FLOWER_KEY_ETH_SRC_MASK:
+		return "eth_src_mask"
+	case nl.TCA_FLOWER_KEY_ETH_TYPE:
+		return "eth_type"
+	case nl.TCA_FLOWER_KEY_IP_PROTO:
+		return "ip_proto"
+	case nl.TCA_FLOWER_KEY_VLAN_ID:
+		return "vlan_id"
+	case nl.TCA_FLOWER_KEY_VLAN_PRIO:
+		return "vlan_prio"
+	case nl.TCA_FLOWER_KEY_VLAN_ETH_TYPE:
+		return "vlan_eth_type"
+	default:
+		return fmt.Sprintf("unknown(%d)", id)
+	}
+}
+
+// Since many of the flower keys has same underlying data there are generic key's types,
+// which can be used directly instead of With methods, but better not.
+
+type FlowerKeyEthAddr struct {
+	id   int
+	addr net.HardwareAddr
+}
+
+func (k *FlowerKeyEthAddr) Serialize() []byte {
+	return k.addr
+}
+
+func (k *FlowerKeyEthAddr) Deserialize(bytes []byte) {
+	k.addr = bytes[0:6]
+}
+
+func (k *FlowerKeyEthAddr) ID() int {
+	return k.id
+}
+
+func (k *FlowerKeyEthAddr) String() string {
+	return fmt.Sprintf("%s: %s", flowerKeyId2String(k.id), k.addr)
+}
+
+type FlowerKeyU8 struct {
+	id  int
+	val uint8
+}
+
+func (k *FlowerKeyU8) Serialize() []byte {
+	bytes := make([]byte, 1)
+	bytes[0] = k.val
+	return bytes
+}
+
+func (k *FlowerKeyU8) Deserialize(bytes []byte) {
+	k.val = bytes[0]
+}
+
+func (k *FlowerKeyU8) ID() int {
+	return k.id
+}
+
+// Return string representation of most used ip protocols
+func ipProto2String(proto uint8) string {
+	switch proto {
+	case unix.IPPROTO_ICMP:
+		return "IPPROTO_ICMP"
+	case unix.IPPROTO_ICMPV6:
+		return "IPPROTO_ICMPV6"
+	case unix.IPPROTO_IP:
+		return "IPPROTO_IPV6"
+	case unix.IPPROTO_IPV6:
+		return "IPPROTO_IPV6"
+	case unix.IPPROTO_TCP:
+		return "IPPROTO_TCP"
+	case unix.IPPROTO_UDP:
+		return "IPPROTO_UDP"
+	default:
+		return fmt.Sprintf("%d", proto)
+	}
+}
+
+func (k *FlowerKeyU8) String() string {
+	if k.id != nl.TCA_FLOWER_KEY_IP_PROTO {
+		return fmt.Sprintf("%s: %#x", flowerKeyId2String(k.id), k.val)
+	}
+	return fmt.Sprintf("%s: %s", flowerKeyId2String(k.id), ipProto2String(k.val))
+}
+
+type FlowerKeyU16 struct {
+	id  int
+	val uint16
+}
+
+// U16 value in network order
+func (k *FlowerKeyU16) Serialize() []byte {
+	return htons(k.val)
+}
+
+func (k *FlowerKeyU16) Deserialize(bytes []byte) {
+	k.val = ntohs(bytes[0:2])
+}
+
+func (k *FlowerKeyU16) ID() int {
+	return k.id
+}
+
+func (k *FlowerKeyU16) String() string {
+	return fmt.Sprintf("%s: %#x", flowerKeyId2String(k.id), k.val)
+}
+
+// Vlan ID is 12 bit host ordered value and should be handled separately
+type FlowerKeyVlanID struct {
+	id  int
+	val uint16
+}
+
+func (k *FlowerKeyVlanID) Serialize() []byte {
+	bytes := make([]byte, 2)
+	native.PutUint16(bytes, k.val)
+	return bytes
+}
+
+func (k *FlowerKeyVlanID) Deserialize(bytes []byte) {
+	k.val = native.Uint16(bytes[0:2])
+}
+
+func (k *FlowerKeyVlanID) ID() int {
+	return k.id
+}
+
+func (k *FlowerKeyVlanID) String() string {
+	return fmt.Sprintf("vlan_id: %d", k.val)
 }
 
 // FilterDel will delete a filter from the system.
@@ -283,11 +595,74 @@ func (h *Handle) filterModify(filter Filter, flags int) error {
 		if filter.ClassId != 0 {
 			options.AddRtAttr(nl.TCA_MATCHALL_CLASSID, nl.Uint32Attr(filter.ClassId))
 		}
+	case *Flower:
+		if filter.ClassId != 0 {
+			options.AddRtAttr(nl.TCA_FLOWER_CLASSID, nl.Uint32Attr(filter.ClassId))
+		}
+
+		if filter.Protocol != unix.ETH_P_ALL {
+			options.AddRtAttr(nl.TCA_FLOWER_KEY_ETH_TYPE, htons(filter.Protocol))
+		}
+
+		if filter.Flags&^nl.TCA_CLS_FLAGS_INPUT_MASK != 0 {
+			return fmt.Errorf("not allowed flags for flower classifier")
+		}
+		options.AddRtAttr(nl.TCA_FLOWER_FLAGS, nl.Uint32Attr(filter.Flags))
+
+		if err := parseFlowerFilterKeys(options, filter); err != nil {
+			return err
+		}
+
+		actionsAttr := options.AddRtAttr(nl.TCA_FLOWER_ACT, nil)
+		if err := EncodeActions(actionsAttr, filter.Actions); err != nil {
+			return err
+		}
 	}
 
 	req.AddData(options)
 	_, err := req.Execute(unix.NETLINK_ROUTE, 0)
 	return err
+}
+
+func parseFlowerFilterKeys(options *nl.RtAttr, filter *Flower) error {
+	// Iterate over all keys to keep order
+	for i := nl.TCA_FLOWER_KEY_ETH_DST; i <= nl.TCA_FLOWER_KEY_MPLS_OPTS; i++ {
+		key, exist := filter.Keys[i]
+		if !exist {
+			continue
+		}
+		// Validate values first
+		switch i {
+		case nl.TCA_FLOWER_KEY_ETH_DST,
+			nl.TCA_FLOWER_KEY_ETH_DST_MASK,
+			nl.TCA_FLOWER_KEY_ETH_SRC,
+			nl.TCA_FLOWER_KEY_ETH_SRC_MASK:
+			ethKey, _ := key.(*FlowerKeyEthAddr)
+			if len(ethKey.addr) != 6 {
+				return fmt.Errorf("expected 6 byte len address - have %s", ethKey)
+			}
+		case nl.TCA_FLOWER_KEY_VLAN_ID:
+			vlanId, _ := key.(*FlowerKeyVlanID)
+			if vlanId.val&^0xfff != 0 {
+				return fmt.Errorf("vlan id isn't a 12bit value.")
+			}
+			if filter.Protocol != unix.ETH_P_8021AD && filter.Protocol != unix.ETH_P_8021Q {
+				return fmt.Errorf("can't set vlan id if filter protocol isn't 802.1Q or 802.1AD")
+			}
+		case nl.TCA_FLOWER_KEY_VLAN_PRIO:
+			vlanPrio, _ := key.(*FlowerKeyU8)
+			if vlanPrio.val&^0x7 != 0 {
+				return fmt.Errorf("vlan prio isn't a 3bit value.")
+			}
+			fallthrough
+		case nl.TCA_FLOWER_KEY_VLAN_ETH_TYPE:
+			if filter.Protocol != unix.ETH_P_8021AD && filter.Protocol != unix.ETH_P_8021Q {
+				return fmt.Errorf("can't set vlan prio/ethtype if rotocol isn't 802.1Q or 802.1AD")
+			}
+		}
+		options.AddRtAttr(i, key.Serialize())
+	}
+	return nil
 }
 
 // FilterList gets a list of filters in the system.
@@ -351,6 +726,8 @@ func (h *Handle) FilterList(link Link, parent uint32) ([]Filter, error) {
 					filter = &BpfFilter{}
 				case "matchall":
 					filter = &MatchAll{}
+				case "flower":
+					filter = &Flower{}
 				default:
 					filter = &GenericFilter{FilterType: filterType}
 				}
@@ -377,6 +754,11 @@ func (h *Handle) FilterList(link Link, parent uint32) ([]Filter, error) {
 					}
 				case "matchall":
 					detailed, err = parseMatchAllData(filter, data)
+					if err != nil {
+						return nil, err
+					}
+				case "flower":
+					detailed, err = parseFlowerData(filter, data)
 					if err != nil {
 						return nil, err
 					}
@@ -786,6 +1168,49 @@ func parseMatchAllData(filter Filter, data []syscall.NetlinkRouteAttr) (bool, er
 	return detailed, nil
 }
 
+func parseFlowerData(filter Filter, data []syscall.NetlinkRouteAttr) (bool, error) {
+	native = nl.NativeEndian()
+	flower := filter.(*Flower)
+	flower.Keys = make(map[int]FlowerKey)
+	detailed := true
+	for _, datum := range data {
+		id := int(datum.Attr.Type)
+		switch id {
+		case nl.TCA_FLOWER_CLASSID:
+			flower.ClassId = native.Uint32(datum.Value[0:4])
+		case nl.TCA_FLOWER_FLAGS:
+			flower.Flags = native.Uint32(datum.Value[0:4])
+		case nl.TCA_FLOWER_KEY_ETH_DST,
+			nl.TCA_FLOWER_KEY_ETH_DST_MASK,
+			nl.TCA_FLOWER_KEY_ETH_SRC,
+			nl.TCA_FLOWER_KEY_ETH_SRC_MASK:
+			flower.Keys[id] = &FlowerKeyEthAddr{id: id}
+			flower.Keys[id].Deserialize(datum.Value)
+		case nl.TCA_FLOWER_KEY_IP_PROTO,
+			nl.TCA_FLOWER_KEY_VLAN_PRIO:
+			flower.Keys[id] = &FlowerKeyU8{id: id}
+			flower.Keys[id].Deserialize(datum.Value)
+		case nl.TCA_FLOWER_KEY_VLAN_ID:
+			flower.Keys[id] = &FlowerKeyVlanID{id: id}
+			flower.Keys[id].Deserialize(datum.Value)
+		case nl.TCA_FLOWER_KEY_ETH_TYPE,
+			nl.TCA_FLOWER_KEY_VLAN_ETH_TYPE:
+			flower.Keys[id] = &FlowerKeyU16{id: id}
+			flower.Keys[id].Deserialize(datum.Value)
+		case nl.TCA_FLOWER_ACT:
+			tables, err := nl.ParseRouteAttr(datum.Value)
+			if err != nil {
+				return detailed, err
+			}
+			flower.Actions, err = parseActions(tables)
+			if err != nil {
+				return detailed, err
+			}
+		}
+	}
+	return detailed, nil
+}
+
 func AlignToAtm(size uint) uint {
 	var linksize, cells int
 	cells = int(size / nl.ATM_CELL_PAYLOAD)
@@ -844,4 +1269,8 @@ func SerializeRtab(rtab [256]uint32) []byte {
 	var w bytes.Buffer
 	_ = binary.Write(&w, native, rtab)
 	return w.Bytes()
+}
+
+func ethAddrMask() []byte {
+	return []byte{0xff, 0xff, 0xff, 0xff, 0xff, 0xff}
 }
