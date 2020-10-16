@@ -94,6 +94,7 @@ const (
 	SizeofTcTunnelKey    = SizeofTcGen + 0x04
 	SizeofTcSkbEdit      = SizeofTcGen
 	SizeofTcPolice       = 2*SizeofTcRateSpec + 0x20
+	SizeofTcVlan         = SizeofTcGen + 0x04
 )
 
 // struct tcmsg {
@@ -878,3 +879,36 @@ const (
 	TCA_HFSC_FSC
 	TCA_HFSC_USC
 )
+
+//struct tc_vlan {
+//	tc_gen;
+//	int v_action;
+//};
+
+const (
+	TCA_VLAN_UNSPEC = iota
+	TCA_VLAN_TM
+	TCA_VLAN_PARMS
+	TCA_VLAN_PUSH_VLAN_ID
+	TCA_VLAN_PUSH_VLAN_PROTOCOL
+	TCA_VLAN_PAD
+	TCA_VLAN_PUSH_VLAN_PRIORITY
+	TCA_VLAN_MAX = TCA_VLAN_PUSH_VLAN_PRIORITY
+)
+
+type TcVlan struct {
+	TcGen
+	Action int32
+}
+
+func (msg *TcVlan) Len() int {
+	return SizeofTcVlan
+}
+
+func DeserializeTcVlan(b []byte) *TcVlan {
+	return (*TcVlan)(unsafe.Pointer(&b[0:SizeofTcVlan][0]))
+}
+
+func (x *TcVlan) Serialize() []byte {
+	return (*(*[SizeofTcVlan]byte)(unsafe.Pointer(x)))[:]
+}

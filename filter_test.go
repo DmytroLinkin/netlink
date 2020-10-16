@@ -6,6 +6,7 @@ import (
 	"net"
 	"reflect"
 	"testing"
+	"time"
 
 	"golang.org/x/sys/unix"
 )
@@ -780,6 +781,180 @@ func TestFilterU32ConnmarkAddDel(t *testing.T) {
 	}
 	if len(qdiscs) != 0 {
 		t.Fatal("Failed to remove qdisc")
+	}
+}
+
+func addVerifyIngressQdisc(t *testing.T, link Link) *Ingress {
+	qdisc := &Ingress{
+		QdiscAttrs: QdiscAttrs{
+			LinkIndex: link.Attrs().Index,
+			Handle:    MakeHandle(0xffff, 0),
+			Parent:    HANDLE_INGRESS,
+		},
+	}
+	if err := QdiscAdd(qdisc); err != nil {
+		t.Fatal(err)
+	}
+	qdiscs, err := SafeQdiscList(link)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, q := range qdiscs {
+		if q.Attrs().Handle != qdisc.Handle {
+			continue
+		}
+		_, ok := q.(*Ingress)
+		if !ok {
+			t.Fatal("Qdisc is of wrong type")
+		}
+		return qdisc
+	}
+	t.Fatal("Failed to add qdisc")
+	return qdisc
+}
+
+func delVerifyIngressQdisc(t *testing.T, link Link, qdisc *Ingress) {
+	if err := QdiscDel(qdisc); err != nil {
+		t.Fatal(err)
+	}
+	qdiscs, err := SafeQdiscList(link)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, q := range qdiscs {
+		if q.Attrs().Handle != qdisc.Handle {
+			continue
+		}
+		t.Fatal("Failed to remove qdisc")
+	}
+}
+
+func TestFilterU32VlanAddDel(t *testing.T) {
+	tearDown := setUpNetlinkTest(t)
+	defer tearDown()
+
+	if err := LinkAdd(&Ifb{LinkAttrs{Name: "foo"}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := LinkAdd(&Ifb{LinkAttrs{Name: "bar"}}); err != nil {
+		t.Fatal(err)
+	}
+	link, err := LinkByName("foo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := LinkSetUp(link); err != nil {
+		t.Fatal(err)
+	}
+	redir, err := LinkByName("bar")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := LinkSetUp(redir); err != nil {
+		t.Fatal(err)
+	}
+
+	acts := []*VlanAction{
+		NewVlanAction(TCA_VLAN_ACT_PUSH, 20, unix.ETH_P_8021Q, 10),
+		NewVlanAction(TCA_VLAN_ACT_MODIFY, 20, unix.ETH_P_8021Q, 10),
+		NewVlanAction(TCA_VLAN_ACT_POP, 0, 0, 0),
+	}
+
+	qdisc := addVerifyIngressQdisc(t, link)
+	for i, act := range acts {
+		setupAndVerifyVlanAction(t, link, redir.Attrs().Index, act, uint16(i+1))
+	}
+
+	// In new kernels RTM_NEWTFILTER calls runs asynchronously.
+	// Lets not remove qdisc immidiately.
+	time.Sleep(time.Second)
+	delVerifyIngressQdisc(t, link, qdisc)
+}
+
+func setupAndVerifyVlanAction(t *testing.T, link Link, redirIndex int, act *VlanAction, prio uint16) {
+	classId := MakeHandle(1, 1)
+	filter := &U32{
+		FilterAttrs: FilterAttrs{
+			LinkIndex: link.Attrs().Index,
+			Parent:    MakeHandle(0xffff, 0),
+			Priority:  prio,
+			Protocol:  unix.ETH_P_IP,
+		},
+		ClassId: classId,
+		Actions: []Action{
+			act,
+			&MirredAction{
+				ActionAttrs: ActionAttrs{
+					Action: TC_ACT_STOLEN,
+				},
+				MirredAction: TCA_EGRESS_REDIR,
+				Ifindex:      redirIndex,
+			},
+		},
+	}
+
+	if err := FilterAdd(filter); err != nil {
+		t.Fatal(err)
+	}
+
+	filters, err := FilterList(link, MakeHandle(0xffff, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var u32 *U32
+	for _, f := range filters {
+		if f.Attrs().Priority != prio {
+			continue
+		}
+		var ok bool
+		if u32, ok = f.(*U32); !ok {
+			t.Fatal("Filter is of wrong type")
+		}
+		break
+	}
+
+	if len(u32.Actions) != 2 {
+		t.Fatalf("Too few Actions in filter")
+	}
+	if u32.ClassId != classId {
+		t.Fatalf("Wrong ClassId value")
+	}
+
+	// actions can be returned in reverse order
+	va, ok := u32.Actions[0].(*VlanAction)
+	if !ok {
+		va, ok = u32.Actions[1].(*VlanAction)
+		if !ok {
+			t.Fatal("Unable to find vlan action")
+		}
+	}
+
+	if va.Attrs().Action != TC_ACT_PIPE {
+		t.Fatal("Vlan action attribute isn't TC_ACT_PIPE")
+	}
+
+	mia, ok := u32.Actions[0].(*MirredAction)
+	if !ok {
+		mia, ok = u32.Actions[1].(*MirredAction)
+		if !ok {
+			t.Fatal("Unable to find mirred action")
+		}
+	}
+
+	if mia.Attrs().Action != TC_ACT_STOLEN {
+		t.Fatal("Mirred action isn't TC_ACT_STOLEN")
+	}
+
+	if err := FilterDel(filter); err != nil {
+		t.Fatal(err)
+	}
+	filters, err = FilterList(link, MakeHandle(0xffff, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(filters) != 0 {
+		t.Fatal("Failed to remove filter")
 	}
 }
 

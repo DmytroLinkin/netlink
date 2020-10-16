@@ -499,6 +499,28 @@ func EncodeActions(attr *nl.RtAttr, actions []Action) error {
 			aopts.AddRtAttr(nl.TCA_ACT_BPF_PARMS, gen.Serialize())
 			aopts.AddRtAttr(nl.TCA_ACT_BPF_FD, nl.Uint32Attr(uint32(action.Fd)))
 			aopts.AddRtAttr(nl.TCA_ACT_BPF_NAME, nl.ZeroTerminated(action.Name))
+		case *VlanAction:
+			table := attr.AddRtAttr(tabIndex, nil)
+			tabIndex++
+			table.AddRtAttr(nl.TCA_ACT_KIND, nl.ZeroTerminated("vlan"))
+			aopts := table.AddRtAttr(nl.TCA_ACT_OPTIONS, nil)
+			vlan := nl.TcVlan{
+				Action: int32(action.VlanAction),
+			}
+			toTcGen(action.Attrs(), &vlan.TcGen)
+			aopts.AddRtAttr(nl.TCA_VLAN_PARMS, vlan.Serialize())
+			// Ignore VLAN_{ID,PROTO,PRIO} if action is VLAN_POP
+			if action.VlanAction != TCA_VLAN_ACT_POP {
+				aopts.AddRtAttr(nl.TCA_VLAN_PUSH_VLAN_ID, nl.Uint16Attr(action.Id))
+				if action.Proto != 0 && action.Proto != unix.ETH_P_8021AD && action.Proto != unix.ETH_P_8021Q {
+					return fmt.Errorf("protocol %x is not supported", action.Proto)
+				}
+				if action.Proto != 0 {
+					// Should be in network order
+					aopts.AddRtAttr(nl.TCA_VLAN_PUSH_VLAN_PROTOCOL, htons(action.Proto))
+				}
+				aopts.AddRtAttr(nl.TCA_VLAN_PUSH_VLAN_PRIORITY, nl.Uint8Attr(action.Prio))
+			}
 		case *GenericAction:
 			table := attr.AddRtAttr(tabIndex, nil)
 			tabIndex++
@@ -540,6 +562,8 @@ func parseActions(tables []syscall.NetlinkRouteAttr) ([]Action, error) {
 					action = &TunnelKeyAction{}
 				case "skbedit":
 					action = &SkbEditAction{}
+				case "vlan":
+					action = &VlanAction{}
 				default:
 					break nextattr
 				}
@@ -617,6 +641,20 @@ func parseActions(tables []syscall.NetlinkRouteAttr) ([]Action, error) {
 						case nl.TCA_GACT_PARMS:
 							gen := *nl.DeserializeTcGen(adatum.Value)
 							toAttrs(&gen, action.Attrs())
+						}
+					case "vlan":
+						switch adatum.Attr.Type {
+						case nl.TCA_VLAN_PARMS:
+							vlan := *nl.DeserializeTcVlan(adatum.Value)
+							toAttrs(&vlan.TcGen, action.Attrs())
+							action.(*VlanAction).VlanAction = VlanAct(vlan.Action)
+						case nl.TCA_VLAN_PUSH_VLAN_ID:
+							action.(*VlanAction).Id = native.Uint16(adatum.Value[0:2])
+						case nl.TCA_VLAN_PUSH_VLAN_PROTOCOL:
+							// Value in network order
+							action.(*VlanAction).Proto = ntohs(adatum.Value[0:2])
+						case nl.TCA_VLAN_PUSH_VLAN_PRIORITY:
+							action.(*VlanAction).Prio = uint8(adatum.Value[0:1][0])
 						}
 					}
 				}
