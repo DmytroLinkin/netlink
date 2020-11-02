@@ -3,10 +3,13 @@
 package netlink
 
 import (
+	"bytes"
 	"net"
 	"reflect"
 	"testing"
+	"time"
 
+	"github.com/vishvananda/netlink/nl"
 	"golang.org/x/sys/unix"
 )
 
@@ -783,6 +786,180 @@ func TestFilterU32ConnmarkAddDel(t *testing.T) {
 	}
 }
 
+func addVerifyIngressQdisc(t *testing.T, link Link) *Ingress {
+	qdisc := &Ingress{
+		QdiscAttrs: QdiscAttrs{
+			LinkIndex: link.Attrs().Index,
+			Handle:    MakeHandle(0xffff, 0),
+			Parent:    HANDLE_INGRESS,
+		},
+	}
+	if err := QdiscAdd(qdisc); err != nil {
+		t.Fatal(err)
+	}
+	qdiscs, err := SafeQdiscList(link)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, q := range qdiscs {
+		if q.Attrs().Handle != qdisc.Handle {
+			continue
+		}
+		_, ok := q.(*Ingress)
+		if !ok {
+			t.Fatal("Qdisc is of wrong type")
+		}
+		return qdisc
+	}
+	t.Fatal("Failed to add qdisc")
+	return qdisc
+}
+
+func delVerifyIngressQdisc(t *testing.T, link Link, qdisc *Ingress) {
+	if err := QdiscDel(qdisc); err != nil {
+		t.Fatal(err)
+	}
+	qdiscs, err := SafeQdiscList(link)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, q := range qdiscs {
+		if q.Attrs().Handle != qdisc.Handle {
+			continue
+		}
+		t.Fatal("Failed to remove qdisc")
+	}
+}
+
+func TestFilterU32VlanAddDel(t *testing.T) {
+	tearDown := setUpNetlinkTest(t)
+	defer tearDown()
+
+	if err := LinkAdd(&Ifb{LinkAttrs{Name: "foo"}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := LinkAdd(&Ifb{LinkAttrs{Name: "bar"}}); err != nil {
+		t.Fatal(err)
+	}
+	link, err := LinkByName("foo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := LinkSetUp(link); err != nil {
+		t.Fatal(err)
+	}
+	redir, err := LinkByName("bar")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := LinkSetUp(redir); err != nil {
+		t.Fatal(err)
+	}
+
+	acts := []*VlanAction{
+		NewVlanAction(TCA_VLAN_ACT_PUSH, 20, unix.ETH_P_8021Q, 10),
+		NewVlanAction(TCA_VLAN_ACT_MODIFY, 20, unix.ETH_P_8021Q, 10),
+		NewVlanAction(TCA_VLAN_ACT_POP, 0, 0, 0),
+	}
+
+	qdisc := addVerifyIngressQdisc(t, link)
+	for i, act := range acts {
+		setupAndVerifyVlanAction(t, link, redir.Attrs().Index, act, uint16(i+1))
+	}
+
+	// In new kernels RTM_NEWTFILTER calls runs asynchronously.
+	// Lets not remove qdisc immidiately.
+	time.Sleep(time.Second)
+	delVerifyIngressQdisc(t, link, qdisc)
+}
+
+func setupAndVerifyVlanAction(t *testing.T, link Link, redirIndex int, act *VlanAction, prio uint16) {
+	classId := MakeHandle(1, 1)
+	filter := &U32{
+		FilterAttrs: FilterAttrs{
+			LinkIndex: link.Attrs().Index,
+			Parent:    MakeHandle(0xffff, 0),
+			Priority:  prio,
+			Protocol:  unix.ETH_P_IP,
+		},
+		ClassId: classId,
+		Actions: []Action{
+			act,
+			&MirredAction{
+				ActionAttrs: ActionAttrs{
+					Action: TC_ACT_STOLEN,
+				},
+				MirredAction: TCA_EGRESS_REDIR,
+				Ifindex:      redirIndex,
+			},
+		},
+	}
+
+	if err := FilterAdd(filter); err != nil {
+		t.Fatal(err)
+	}
+
+	filters, err := FilterList(link, MakeHandle(0xffff, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var u32 *U32
+	for _, f := range filters {
+		if f.Attrs().Priority != prio {
+			continue
+		}
+		var ok bool
+		if u32, ok = f.(*U32); !ok {
+			t.Fatal("Filter is of wrong type")
+		}
+		break
+	}
+
+	if len(u32.Actions) != 2 {
+		t.Fatalf("Too few Actions in filter")
+	}
+	if u32.ClassId != classId {
+		t.Fatalf("Wrong ClassId value")
+	}
+
+	// actions can be returned in reverse order
+	va, ok := u32.Actions[0].(*VlanAction)
+	if !ok {
+		va, ok = u32.Actions[1].(*VlanAction)
+		if !ok {
+			t.Fatal("Unable to find vlan action")
+		}
+	}
+
+	if va.Attrs().Action != TC_ACT_PIPE {
+		t.Fatal("Vlan action attribute isn't TC_ACT_PIPE")
+	}
+
+	mia, ok := u32.Actions[0].(*MirredAction)
+	if !ok {
+		mia, ok = u32.Actions[1].(*MirredAction)
+		if !ok {
+			t.Fatal("Unable to find mirred action")
+		}
+	}
+
+	if mia.Attrs().Action != TC_ACT_STOLEN {
+		t.Fatal("Mirred action isn't TC_ACT_STOLEN")
+	}
+
+	if err := FilterDel(filter); err != nil {
+		t.Fatal(err)
+	}
+	filters, err = FilterList(link, MakeHandle(0xffff, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(filters) != 0 {
+		t.Fatal("Failed to remove filter")
+	}
+}
+
 func setupLinkForTestWithQdisc(t *testing.T, linkName string) (Qdisc, Link) {
 	if err := LinkAdd(&Ifb{LinkAttrs{Name: linkName}}); err != nil {
 		t.Fatal(err)
@@ -965,6 +1142,186 @@ func TestFilterMatchAllAddDel(t *testing.T) {
 		t.Fatal("Failed to remove filter")
 	}
 
+}
+
+func TestFilterFlowerFlagsAddDel(t *testing.T) {
+	tearDown := setUpNetlinkTest(t)
+	defer tearDown()
+
+	if err := LinkAdd(&Ifb{LinkAttrs{Name: "foo"}}); err != nil {
+		t.Fatal(err)
+	}
+
+	link, err := LinkByName("foo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := LinkSetUp(link); err != nil {
+		t.Fatal(err)
+	}
+	qdisc := addVerifyIngressQdisc(t, link)
+
+	flags := []uint32{
+		0,
+		nl.TCA_CLS_FLAGS_SKIP_HW,
+		// nl.TCA_CLS_FLAGS_SKIP_SW, // test don't use real HW so this flag will fail
+		// nl.TCA_CLS_FLAGS_VERBOSE, // some kernels don't support this flag
+	}
+	for i, flag := range flags {
+		// XXX Basically each test case should be runned in a separate go routine.
+		// But the problem here is that routine bypassing tmp netns created at the
+		// beggining of the test and it's runned in the host netns. BTW, that happens
+		// with some other tests.
+		setupAndVerifyFlowerFilter(t, link, flag, uint16(i+1))
+	}
+	delVerifyIngressQdisc(t, link, qdisc)
+}
+
+func setupAndVerifyFlowerFilter(t *testing.T, link Link, flags uint32, prio uint16) {
+	attrs := FilterAttrs{
+		LinkIndex: link.Attrs().Index,
+		Parent:    MakeHandle(0xffff, 0),
+		Priority:  prio,
+		Protocol:  unix.ETH_P_IP,
+	}
+	acts := []Action{
+		&GenericAction{
+			ActionAttrs: ActionAttrs{
+				Action: TC_ACT_SHOT,
+			},
+		},
+	}
+	filter := NewFlowerFilter(attrs, MakeHandle(1, 1), flags)
+	filter.Actions = acts
+
+	if err := FilterAdd(filter); err != nil {
+		t.Fatal(err)
+	}
+
+	filters, err := FilterList(link, MakeHandle(0xffff, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(filters) != 1 {
+		t.Fatal("Failed to add filter")
+	}
+	flower, ok := filters[0].(*Flower)
+	if !ok {
+		t.Fatal("Filter is of wrong type")
+	}
+	flags |= nl.TCA_CLS_FLAGS_NOT_IN_HW
+	if flower.Flags != flags {
+		t.Fatalf("Wrong filter flags: expected - %x / received - %x", flags, flower.Flags)
+	}
+
+	if err := FilterDel(filter); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestFilterFlowerKeysSerializeDeserialize(t *testing.T) {
+
+	var cases = []struct {
+		name     string
+		key      FlowerKey
+		rawBytes []byte
+	}{
+		{
+			name:     "FlowerKeyEthAddr",
+			key:      &FlowerKeyEthAddr{},
+			rawBytes: []byte{0x11, 0x22, 0x33, 0x44, 0x55, 0x66},
+		},
+		{
+			name:     "FlowerKeyU8",
+			key:      &FlowerKeyU8{},
+			rawBytes: []byte{0x11},
+		},
+		{
+			name:     "FlowerKeyU16",
+			key:      &FlowerKeyU16{},
+			rawBytes: []byte{0x11, 0x22},
+		},
+		{
+			name:     "FlowerKeyVlanID",
+			key:      &FlowerKeyVlanID{},
+			rawBytes: []byte{0x11, 0xa},
+		},
+	}
+
+	for _, tt := range cases {
+		tt.key.Deserialize(tt.rawBytes)
+		b := tt.key.Serialize()
+		if !bytes.Equal(tt.rawBytes, b) {
+			t.Fatalf("%s wrong bytes", tt.name)
+		}
+	}
+}
+
+func TestFilterFlowerKeysAddDel(t *testing.T) {
+	tearDown := setUpNetlinkTest(t)
+	defer tearDown()
+
+	if err := LinkAdd(&Ifb{LinkAttrs{Name: "foo"}}); err != nil {
+		t.Fatal(err)
+	}
+
+	link, err := LinkByName("foo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := LinkSetUp(link); err != nil {
+		t.Fatal(err)
+	}
+	qdisc := addVerifyIngressQdisc(t, link)
+	attrs := FilterAttrs{
+		LinkIndex: link.Attrs().Index,
+		Parent:    MakeHandle(0xffff, 0),
+		Protocol:  unix.ETH_P_IP,
+	}
+	vlanAttrs := FilterAttrs{
+		LinkIndex: link.Attrs().Index,
+		Parent:    MakeHandle(0xffff, 0),
+		Protocol:  unix.ETH_P_8021Q,
+	}
+
+	ethAddr, err := net.ParseMAC("e4:11:22:33:44:55")
+	if err != nil {
+		t.Fatal(err)
+	}
+	classId := MakeHandle(1, 1)
+	filters := []Filter{
+		NewFlowerFilter(attrs, classId, 0),
+		NewFlowerFilter(attrs, classId, 0).WithKeyEthSrc(ethAddr),
+		NewFlowerFilter(attrs, classId, 0).WithMaskedEthDst(ethAddr, ethAddr),
+		NewFlowerFilter(attrs, classId, 0).WithKeyEthType(unix.ETH_P_IPV6),
+		NewFlowerFilter(attrs, classId, 0).WithKeyIpProto(unix.IPPROTO_TCP),
+		NewFlowerFilter(vlanAttrs, classId, 0).WithKeyVlanID(0xabc),
+		NewFlowerFilter(vlanAttrs, classId, 0).WithKeyVlanPrio(0x4),
+		NewFlowerFilter(vlanAttrs, classId, 0).WithKeyVlanEthType(unix.ETH_P_ARP),
+	}
+
+	for i, filter := range filters {
+		filter.Attrs().Priority = uint16(i + 1)
+		if err := FilterAdd(filter); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	addedFilters, err := FilterList(link, MakeHandle(0xffff, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(addedFilters) != len(filters) {
+		t.Fatal("Wrong number of added filters")
+	}
+
+	for _, filter := range addedFilters {
+		_, ok := filter.(*Flower)
+		if !ok {
+			t.Fatal("Filter is of wrong type")
+		}
+	}
+	delVerifyIngressQdisc(t, link, qdisc)
 }
 
 func TestFilterU32TunnelKeyAddDel(t *testing.T) {

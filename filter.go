@@ -260,6 +260,64 @@ func NewSkbEditAction() *SkbEditAction {
 	}
 }
 
+type VlanAct int8
+
+const (
+	TCA_VLAN_ACT_POP    VlanAct = 1
+	TCA_VLAN_ACT_PUSH   VlanAct = 2
+	TCA_VLAN_ACT_MODIFY VlanAct = 3
+)
+
+func (a VlanAct) String() string {
+	switch a {
+	case TCA_VLAN_ACT_POP:
+		return "vlan_pop"
+	case TCA_VLAN_ACT_PUSH:
+		return "vlan_push"
+	case TCA_VLAN_ACT_MODIFY:
+		return "vlan_modify"
+	default:
+		return ""
+	}
+}
+
+type VlanAction struct {
+	ActionAttrs
+	VlanAction VlanAct
+	Id         uint16
+	Proto      uint16
+	Prio       uint8
+}
+
+func (action *VlanAction) Type() string {
+	return "vlan"
+}
+
+func (action *VlanAction) Attrs() *ActionAttrs {
+	return &action.ActionAttrs
+}
+
+func NewVlanAction(action VlanAct, id, proto uint16, prio uint8) *VlanAction {
+	return &VlanAction{
+		ActionAttrs: ActionAttrs{
+			Action: TC_ACT_PIPE,
+		},
+		VlanAction: action,
+		Id:         id,
+		Proto:      proto,
+		Prio:       prio,
+	}
+}
+
+func (action *VlanAction) String() string {
+	if action.VlanAction != TCA_VLAN_ACT_POP {
+		return fmt.Sprintf("Vlan{Attrs%s, VlanAct: %s, Id: %x, Proto: %x, Prio: %x}",
+			action.ActionAttrs, action.VlanAction, action.Id, action.Proto, action.Prio)
+	} else {
+		return fmt.Sprintf("Vlan{Attrs%s, VlanAct: %s}", action.ActionAttrs, action.VlanAction)
+	}
+}
+
 // MatchAll filters match all packets
 type MatchAll struct {
 	FilterAttrs
